@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template deploys Bedrock Knowledge Base along with Aurora Serverless cluster
+  as its vector store. (qs-1l9dmnt5e)
+Metadata:
+  cfn-lint:
+      config:
+        ignore_checks:
+          - ERDSStorageEncryptionEnabled
+          - E3002
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Secret Manager Configuration
+        Parameters:
+          - SecretsKMSKeyId
+      - Label:
+          default: Aurora Database Cluster Configuration
+        Parameters:
+          - AuroraDBName
+          - AuroraDBUsername
+          - AuroraDBSubnetGroupName
+          - AuroraDBNetworkType
+          - AuroraDBEncryption
+          - AuroraDBKMSKeyId
+          - AuroraDBMinCapacity
+          - AuroraDBMaxCapacity
+          - AuroraDBStorageType
+    ParameterLabels:
+      SecretsKMSKeyId:
+        default: KMS Key Arn
+      AuroraDBName:
+        default: Aurora Cluster Database name
+      AuroraDBUsername:
+        default: Aurora Cluster Username
+      AuroraDBSubnetGroupName:
+        default: Aurora DB Subnet Group name
+      AuroraDBNetworkType:
+        default: Aurora Cluster Network Type
+      AuroraDBEncryption:
+        default: Aurora Cluster Encryption
+      AuroraDBKMSKeyId:
+        default: Aurora Cluster Encryption KMS Key Arn
+      AuroraDBMinCapacity:
+        defaut: Aurora Cluster Minimum Capacity
+      AuroraDBMaxCapacity:
+        default: Aurora Cluster Maximum Capactiy
+      AuroraDBStorageType:
+        default: Aurora Cluster Storage Type
+
+Parameters:
+  SecretsKMSKeyId:
+    Description: Enter the KMS Key Arn to encrypt the secrets value. Leave it blank if you want to use AWS Managed Key.
+    Type: String
+    Default: ''
+  AuroraDBName:
+    Description: Enter the Database name for the Aurora Cluster. 
+    Type: String
+    Default: Bedrock_KB_Cluster
+  AuroraDBUsername:
+    Description: Enter the Username for the Aurora Cluster.
+    Type: String
+    Default: AuroraBedrockAdmin
+  AuroraDBSubnetGroupName:
+    Description: Enter the DB Subnet Group name for the Aurora Cluster.
+    Type: String
+    Default: default
+  AuroraDBNetworkType:
+    Description: Enter the network type of the Aurora cluster.
+    Type: String
+    AllowedValues:
+      - IPV4
+      - DUAL
+    Default: IPV4
+  AuroraDBEncryption:
+    Description: Aurora Cluster Encryption needed, true or false.
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  AuroraDBKMSKeyId:
+    Description: Enter KMS key Arn that is used to encrypt the database instances in the Aurora cluster. Leave it blank if you want to use AWS Managed Key.
+    Type: String
+    Default: ''
+  AuroraDBMinCapacity:
+    Description: Enter Aurora Cluster minimum capacity.
+    Type: Number
+    Default: 0.5
+  AuroraDBMaxCapacity:
+    Description: Enter Aurora Cluster maximum capacity.
+    Type: Number
+    Default: 16
+  AuroraDBStorageType:
+    Description: Enter Aurora Cluster storage type.
+    Type: String
+    AllowedValues:
+      - aurora
+      - aurora-iopt1
+    Default: aurora
+  
+Conditions:
+  SecretsDefaultKMSKey: !Equals [!Ref SecretsKMSKeyId, '']
+  DefaultSubnetGroup: !Equals [!Ref AuroraDBSubnetGroupName, 'default']
+  AuroraDBDefaultKMSKey: !Equals [!Ref AuroraDBKMSKeyId, '']
+
+Resources:
+  BedrockUserSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Description: 'Secret required for Bedrock Knowledge Base to interact with Aurora Cluster'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "bedrock_user"}'
+        GenerateStringKey: 'password'
+        ExcludeCharacters: "/'\"@"
+        IncludeSpace: false
+      KmsKeyId: !If [SecretsDefaultKMSKey, !Ref "AWS::NoValue", !Ref SecretsKMSKeyId]
+  
+  AuroraDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Security Group associated with Aurora Cluster as part of Aurora Bedrock Quick Create'
+      VpcID: !Ref "AWS::NoValue"
+  
+  AuroraDBSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt AuroraDBSecurityGroup.GroupId
+      SourceSecurityGroupId: !GetAtt AuroraDBSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+  
+  AuroraDBCluster:
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      DatabaseName: !Ref AuroraDBName
+      DBSubnetGroupName: !If [DefaultSubnetGroup, !Ref "AWS::NoValue", !Ref AuroraDBSubnetGroupName]
+      NetworkType: !Ref AuroraDBNetworkType
+      EnableHttpEndpoint: true
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      Port: 5432
+      StorageEncrypted: !Ref AuroraDBEncryption
+      KmsKeyId: !If [AuroraDBDefaultKMSKey, !Ref "AWS::NoValue", !Ref AuroraDBKMSKeyId]
+      ManageMasterUserPassword: true
+      MasterUsername: !Ref AuroraDBUsername
+      MasterUserSecret: 
+        !If
+          - SecretsDefaultKMSKey
+          - !Ref "AWS::NoValue"
+          - 
+            KmsKeyId: !Ref SecretsKMSKeyId
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraDBMinCapacity
+        MaxCapacity: !Ref AuroraDBMaxCapacity
+      StorageType: !Ref AuroraDBStorageType
+      VpcSecurityGroupIds: [!GetAtt AuroraDBSecurityGroup.GroupId]
+      Tags: !Ref "AWS::NoValue"
+
+  AuroraDBInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      PubliclyAccessible: false
+
+  SeedingLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: Execution role for the seeding Aurora DB Lambda Function
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal: 
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - 'sts:AssumeRole'
+      Policies: 
+        !If 
+          - SecretsDefaultKMSKey
+          - !Ref 'AWS::NoValue'
+          - 
+            - PolicyName: SecretKMSDecryptPermission
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement: 
+                  - Sid: KMSDecryptStatement
+                    Effect: Allow
+                    Action: 
+                      - 'kms:Decrypt'
+                    Resource:
+                      - !Ref SecretsKMSKeyId
+                    Condition:
+                      StringEquals:
+                        kms:ViaService:
+                          - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+  
+  SeedingLambdaRolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: Managed Policy for the execution role of the seeding Aurora DB Lambda Function
+      ManagedPolicyName: !Sub 
+                          - "${Role_ID}Policy"
+                          - Role_ID: !GetAtt SeedingLambdaRole.RoleId
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'rds-data:ExecuteStatement'
+            Resource:
+              - !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraDBCluster}"
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+            Resource:
+              - !GetAtt AuroraDBCluster.MasterUserSecret.SecretArn
+              - !Sub "${BedrockUserSecret}"
+          - Effect: Allow
+            Action: 
+              - 'iam:DeleteRole'
+              - 'iam:DetachRolePolicy'
+              - 'iam:DeleteRolePolicy'
+              - 'iam:ListRolePolicies'
+            Resource:
+              - !GetAtt SeedingLambdaRole.Arn
+          - Effect: Allow
+            Action:
+              - 'iam:DeletePolicy'
+              - 'iam:GetPolicy'
+              - 'iam:ListPolicyVersions'
+            Resource:
+              - !Sub 
+                - "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${Role_ID}Policy"
+                - Role_ID: !GetAtt SeedingLambdaRole.RoleId
+          - Effect: Allow
+            Action:
+              - 'lambda:DeleteFunction'
+            Resource:
+              - !GetAtt SeedingFunction.Arn
+      Roles: [!Ref SeedingLambdaRole]
+  
+  SeedingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: A lambda function to seed the Aurora Database with necessary bedrock-specific tables, extensions and indices
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt SeedingLambdaRole.Arn
+      Timeout: 240
+      Code: 
+        ZipFile: >
+            const { RDSDataClient, ExecuteStatementCommand } = require("@aws-sdk/client-rds-data");
+            const { GetSecretValueCommand, SecretsManagerClient } = require("@aws-sdk/client-secrets-manager");
+            const { LambdaClient, DeleteFunctionCommand } = require("@aws-sdk/client-lambda");
+            const { IAMClient, DeletePolicyCommand, DeleteRoleCommand, DetachRolePolicyCommand, ListRolePoliciesCommand, DeleteRolePolicyCommand } = require("@aws-sdk/client-iam");
+
+            exports.handler = async function (event, context) {
+
+                if (event.RequestType == 'Delete') {
+                    var responseData = { Value: event.ResourceProperties.AuroraDBClusterArn, Reason: "Success" };
+                    await sendResponse(event, context, "SUCCESS", responseData);
+                }
+
+                const rdsClient = new RDSDataClient();
+                const smClient = new SecretsManagerClient();
+                const iamClient = new IAMClient();
+                const lambdaClient = new LambdaClient();
+
+                const extensionInput = {
+                    resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                    secretArn: event.ResourceProperties.AuroraDBClusterAdminSecretArn,
+                    sql: 'CREATE EXTENSION IF NOT EXISTS vector;',
+                    database: event.ResourceProperties.AuroraDBName,
+                    continueAfterTimeout: true,
+                };
+
+                const schemaInput = {
+                    resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                    secretArn: event.ResourceProperties.AuroraDBClusterAdminSecretArn,
+                    sql: 'CREATE SCHEMA bedrock_integration;',
+                    database: event.ResourceProperties.AuroraDBName,
+                    continueAfterTimeout: true,
+                };
+
+                const passwordInput = {
+                    SecretId: event.ResourceProperties.BedrockUserSecretArn
+                };
+
+                const passwordCommand = new GetSecretValueCommand(passwordInput);
+
+                try {
+                    const passwordResponse = await smClient.send(passwordCommand);
+
+                    const secret = JSON.parse(passwordResponse.SecretString);
+                    const password = secret["password"];
+
+                    const roleInput = {
+                        resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                        secretArn: event.ResourceProperties.AuroraDBClusterAdminSecretArn,
+                        sql: `CREATE ROLE bedrock_user WITH LOGIN PASSWORD '${password}'`,
+                        database: event.ResourceProperties.AuroraDBName,
+                        continueAfterTimeout: true
+                    };
+
+                    const grantInput = {
+                        resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                        secretArn: event.ResourceProperties.AuroraDBClusterAdminSecretArn,
+                        sql: "GRANT ALL ON SCHEMA bedrock_integration TO bedrock_user;",
+                        database: event.ResourceProperties.AuroraDBName,
+                        continueAfterTimeout: true,
+                    };
+
+                    const tableInput = {
+                        resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                        secretArn: event.ResourceProperties.BedrockUserSecretArn,
+                        sql: "CREATE TABLE bedrock_integration.bedrock_knowledge_base (id uuid PRIMARY KEY,embedding vector(1536),chunks text,metadata jsonb);",
+                        database: event.ResourceProperties.AuroraDBName,
+                        continueAfterTimeout: true,
+                    };
+
+                    const indexInput = {
+                        resourceArn: event.ResourceProperties.AuroraDBClusterArn,
+                        secretArn: event.ResourceProperties.BedrockUserSecretArn,
+                        sql: "CREATE INDEX ON bedrock_integration.bedrock_knowledge_base USING hnsw (embedding vector_cosine_ops);",
+                        database: event.ResourceProperties.AuroraDBName,
+                        continueAfterTimeout: true,
+                    };
+
+                    const detachRolePolicyInput = {
+                        RoleName: event.ResourceProperties.SeedingLambdaRoleName,
+                        PolicyArn: event.ResourceProperties.SeedingLambdaPolicyArn
+                    };
+
+                    const deletePolicyInput = {
+                        PolicyArn: event.ResourceProperties.SeedingLambdaPolicyArn
+                    };
+
+                    const listRoleInlinePoliciesInput = {
+                        RoleName: event.ResourceProperties.SeedingLambdaRoleName
+                    };
+
+                    const deleteRoleInput = {
+                        RoleName: event.ResourceProperties.SeedingLambdaRoleName
+                    };
+
+                    const deleteFunctionInput = {
+                        FunctionName: event.ResourceProperties.SeedingFunctionName
+                    };
+
+
+                    const extensionCommand = new ExecuteStatementCommand(extensionInput);
+                    const schemaCommand = new ExecuteStatementCommand(schemaInput);
+                    const roleCommand = new ExecuteStatementCommand(roleInput);
+                    const grantCommand = new ExecuteStatementCommand(grantInput);
+                    const tableCommand = new ExecuteStatementCommand(tableInput);
+                    const indexCommand = new ExecuteStatementCommand(indexInput);
+                    const detachRolePolicyCommand = new DetachRolePolicyCommand(detachRolePolicyInput);
+                    const deletePolicyCommand = new DeletePolicyCommand(deletePolicyInput);
+                    const listRoleInlinePoliciesCommand = new ListRolePoliciesCommand(listRoleInlinePoliciesInput);
+                    const deleteRoleCommand = new DeleteRoleCommand(deleteRoleInput);
+                    const deleteFunctionCommand = new DeleteFunctionCommand(deleteFunctionInput);
+
+                    const extensionResponse = await rdsClient.send(extensionCommand);
+                    const schemaResponse = await rdsClient.send(schemaCommand);
+                    const roleResponse = await rdsClient.send(roleCommand);
+                    const grantResponse = await rdsClient.send(grantCommand);
+                    const tableResponse = await rdsClient.send(tableCommand);
+                    const indexResponse = await rdsClient.send(indexCommand);
+                    const deleteFunctionResponse = await lambdaClient.send(deleteFunctionCommand);
+                    const detachPolicyResponse = await iamClient.send(detachRolePolicyCommand);
+
+                    const listRoleInlinePoliciesResponse = await iamClient.send(listRoleInlinePoliciesCommand);
+
+                    for (const inlinePolicyName of listRoleInlinePoliciesResponse.PolicyNames) {
+
+                        const deleteInlinePolicyInput = {
+                            RoleName: event.ResourceProperties.SeedingLambdaRoleName,
+                            PolicyName: inlinePolicyName
+                        }
+
+                        const deleteInlinePolicyCommand = new DeleteRolePolicyCommand(deleteInlinePolicyInput);
+                        const deleteInlinePolicyResponse = await iamClient.send(deleteInlinePolicyCommand);
+                    }
+
+                    const deleteRoleResponse = await iamClient.send(deleteRoleCommand);
+                    const deletePolicyResponse = await iamClient.send(deletePolicyCommand);
+
+                    var responseData = { Value: event.ResourceProperties.AuroraDBClusterArn, Reason: "Success" };
+                    await sendResponse(event, context, "SUCCESS", responseData);
+
+                } catch (err) {
+                    var responseData = { Value: event.ResourceProperties.AuroraDBClusterArn, Reason: err.toString() };
+                    await sendResponse(event, context, "FAILED", responseData);
+                }
+                return event.ResourceProperties.AuroraDBClusterArn;
+            };
+
+            async function sendResponse(event, context, responseStatus, responseData) {
+                let responsePromise = new Promise((resolve, reject) => {
+                    var responseBody = JSON.stringify({
+                        Status: responseStatus,
+                        Reason: responseData.Reason,
+                        PhysicalResourceId: event.LogicalResourceId,
+                        StackId: event.StackId,
+                        RequestId: event.RequestId,
+                        LogicalResourceId: event.LogicalResourceId,
+                        Data: responseData
+                    });
+
+                    var https = require("https");
+                    var url = require("url");
+                    var parsedUrl = url.parse(event.ResponseURL);
+                    var options = {
+                        hostname: parsedUrl.hostname,
+                        path: parsedUrl.path,
+                        method: "PUT",
+                        headers: {
+                            "content-type": "",
+                            "content-length": responseBody.length
+                        }
+                    };
+
+                    var request = https.request(options, function (response) {
+                        resolve(JSON.parse(responseBody));
+                        context.done();
+                    });
+                    request.on("error", function (error) {
+                        reject(error);
+                        context.done();
+                    });
+                    request.write(responseBody);
+                    request.end();
+                });
+                return await responsePromise;
+            };
+  
+  SeedingStep:
+    Type: Custom::SeedingStep
+    Properties:
+      ServiceToken: !GetAtt SeedingFunction.Arn
+      AuroraDBClusterArn: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraDBCluster}"
+      AuroraDBClusterAdminSecretArn: !GetAtt AuroraDBCluster.MasterUserSecret.SecretArn
+      AuroraDBName: !Ref AuroraDBName
+      BedrockUserSecretArn: !Sub "${BedrockUserSecret}"
+      SeedingLambdaPolicyArn: !Ref SeedingLambdaRolePolicy
+      SeedingLambdaRoleName: !Ref SeedingLambdaRole
+      SeedingFunctionName: !Ref SeedingFunction
+      Timeout: 300
+    DependsOn: AuroraDBInstance
